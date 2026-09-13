@@ -1,160 +1,535 @@
-/*
-  ECG over BLE - CJMCU-8232 (AD8232) + ESP32
-  ------------------------------------------
-  Membaca sinyal ECG dari AD8232 lewat ADC, lalu mengirimkannya
-  melalui BLE Notify ke web app (Web Bluetooth API).
-
-  Koneksi hardware:
-    AD8232 OUTPUT -> ESP32 GPIO34 (ADC1, input only)
-    AD8232 LO+    -> ESP32 GPIO32
-    AD8232 LO-    -> ESP32 GPIO33
-    AD8232 3.3V   -> ESP32 3V3
-    AD8232 GND    -> ESP32 GND
-
-  Format paket BLE (setiap notifikasi):
-    byte 0     : status lead-off (1 = elektroda lepas, 0 = normal)
-    byte 1     : jumlah sampel dalam paket ini (N)
-    byte 2..   : N sampel ADC, masing-masing uint16 little-endian (0-4095)
-
-  Sampel dikumpulkan dulu dalam buffer lalu dikirim sekaligus per
-  batch supaya jumlah notifikasi BLE per detik tidak terlalu tinggi
-  (BLE punya batas practical notification rate).
-
-  Sebelum dikirim, tiap sampel melewati filter software (moving average
-  + high-pass) untuk meredam noise ADC dan baseline wander. Penguatan
-  (gain) tampilan diatur di sisi web app agar bisa disesuaikan tanpa
-  perlu flash ulang firmware.
-*/
-
-#include <Arduino.h>
-#include <BLEDevice.h>
-#include <BLEServer.h>
-#include <BLEUtils.h>
-#include <BLE2902.h>
-
-// ---------- Konfigurasi pin ----------
-const int PIN_ECG      = 34;
-const int PIN_LO_PLUS  = 32;
-const int PIN_LO_MINUS = 33;
-
-// ---------- Konfigurasi sampling ----------
-const int SAMPLE_INTERVAL_MS = 5;   // 200 Hz
-const int BATCH_SIZE         = 10;  // kirim tiap 10 sampel (~50ms / batch, 20Hz notify)
-
-// ---------- UUID BLE (custom, boleh diganti asal konsisten dgn web app) ----------
-#define SERVICE_UUID        "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
-#define CHARACTERISTIC_UUID "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
-
-BLEServer *pServer = nullptr;
-BLECharacteristic *pCharacteristic = nullptr;
-bool deviceConnected = false;
-
-uint16_t sampleBuffer[BATCH_SIZE];
-uint8_t sampleCount = 0;
-uint8_t txPacket[2 + BATCH_SIZE * 2];
-
-// ---------- Filter software (mengurangi noise sebelum dikirim) ----------
-// Moving average: meredam noise frekuensi tinggi dari ADC.
-const int MA_N = 4;
-uint16_t maBuffer[MA_N] = {2048, 2048, 2048, 2048};
-uint8_t maIndex = 0;
-
-// High-pass sederhana: menghilangkan baseline wander (sinyal melayang naik-turun
-// pelan akibat napas/gerakan) sehingga sinyal tetap stabil di sekitar titik tengah.
-const float HP_ALPHA = 0.98f; // makin dekat ke 1, makin lambat baseline "dilupakan"
-float hpPrevRaw = 2048.0f;
-float hpPrevOut = 0.0f;
-
-uint16_t filterSample(uint16_t raw) {
-  maBuffer[maIndex] = raw;
-  maIndex = (maIndex + 1) % MA_N;
-  uint32_t sum = 0;
-  for (int i = 0; i < MA_N; i++) sum += maBuffer[i];
-  float avg = (float)sum / MA_N;
-
-  float hpOut = HP_ALPHA * (hpPrevOut + avg - hpPrevRaw);
-  hpPrevRaw = avg;
-  hpPrevOut = hpOut;
-
-  float centered = 2048.0f + hpOut;
-  if (centered < 0) centered = 0;
-  if (centered > 4095) centered = 4095;
-  return (uint16_t)centered;
-}
-
-class ServerCallbacks : public BLEServerCallbacks {
-  void onConnect(BLEServer *server) override {
-    deviceConnected = true;
-    Serial.println("Web app terhubung.");
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ESP32 ECG Monitor</title>
+<style>
+  :root{
+    --bg: #0a1512;
+    --panel: #0f1e19;
+    --panel-line: #1c352c;
+    --grid: rgba(53, 212, 136, 0.14);
+    --trace: #38e08a;
+    --trace-glow: rgba(56, 224, 138, 0.35);
+    --text: #d8e8e0;
+    --text-dim: #7d998e;
+    --amber: #e8a545;
+    --red: #e05a4f;
+    --mono: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
+    --sans: "Inter", "Segoe UI", system-ui, sans-serif;
   }
-  void onDisconnect(BLEServer *server) override {
-    deviceConnected = false;
-    Serial.println("Web app terputus. Mulai advertising lagi...");
-    delay(200);
-    server->getAdvertising()->start();
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
   }
-};
 
-void setupBLE() {
-  BLEDevice::init("ESP32-ECG");
+  body {
+    display: flex;
+    flex-direction: column;
+    min-height: 100vh;
+  }
 
-  pServer = BLEDevice::createServer();
-  pServer->setCallbacks(new ServerCallbacks());
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 18px 24px;
+    border-bottom: 1px solid var(--panel-line);
+    flex-wrap: wrap;
+    gap: 12px;
+  }
 
-  BLEService *pService = pServer->createService(SERVICE_UUID);
+  header h1 {
+    font-size: 17px;
+    font-weight: 600;
+    margin: 0;
+    letter-spacing: 0.2px;
+  }
 
-  pCharacteristic = pService->createCharacteristic(
-      CHARACTERISTIC_UUID,
-      BLECharacteristic::PROPERTY_NOTIFY);
-  pCharacteristic->addDescriptor(new BLE2902());
+  header h1 span {
+    color: var(--text-dim);
+    font-weight: 400;
+  }
 
-  pService->start();
+  .status {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    color: var(--text-dim);
+  }
 
-  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
-  pAdvertising->addServiceUUID(SERVICE_UUID);
-  pAdvertising->setScanResponse(true);
-  BLEDevice::startAdvertising();
+  .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--text-dim);
+    transition: background 0.2s ease;
+  }
 
-  Serial.println("BLE siap, menunggu koneksi dengan nama \"ESP32-ECG\"...");
-}
+  .dot.live { background: var(--trace); box-shadow: 0 0 8px var(--trace-glow); }
+  .dot.warn { background: var(--amber); }
 
-void setup() {
-  Serial.begin(115200);
+  button {
+    font-family: var(--sans);
+    font-size: 14px;
+    font-weight: 500;
+    padding: 9px 18px;
+    border-radius: 6px;
+    border: 1px solid var(--panel-line);
+    background: var(--panel);
+    color: var(--text);
+    cursor: pointer;
+  }
 
-  pinMode(PIN_LO_PLUS, INPUT);
-  pinMode(PIN_LO_MINUS, INPUT);
+  button:hover { border-color: var(--trace); }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
 
-  analogReadResolution(12);          // 0 - 4095
-  analogSetAttenuation(ADC_11db);    // jangkauan ~0 - 3.3V
+  main {
+    flex: 1;
+    display: flex;
+    gap: 20px;
+    padding: 20px 24px 28px;
+    flex-wrap: wrap;
+  }
 
-  setupBLE();
-}
+  .trace-panel {
+    flex: 1 1 560px;
+    background: var(--panel);
+    border: 1px solid var(--panel-line);
+    border-radius: 10px;
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    min-height: 360px;
+  }
 
-void loop() {
-  static uint32_t lastSample = 0;
-  uint32_t now = millis();
+  .trace-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin-bottom: 10px;
+  }
 
-  if (now - lastSample >= (uint32_t)SAMPLE_INTERVAL_MS) {
-    lastSample = now;
+  .trace-panel .label {
+    font-size: 12px;
+    color: var(--text-dim);
+  }
 
-    bool leadOff = (digitalRead(PIN_LO_PLUS) == HIGH) ||
-                   (digitalRead(PIN_LO_MINUS) == HIGH);
+  .gain-control {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    color: var(--text-dim);
+  }
 
-    uint16_t value = leadOff ? 2048 : filterSample(analogRead(PIN_ECG));
-    sampleBuffer[sampleCount++] = value;
+  .gain-control input[type="range"] {
+    width: 110px;
+    accent-color: var(--trace);
+  }
 
-    if (sampleCount >= BATCH_SIZE) {
-      if (deviceConnected) {
-        txPacket[0] = leadOff ? 1 : 0;
-        txPacket[1] = sampleCount;
-        for (int i = 0; i < sampleCount; i++) {
-          txPacket[2 + i * 2]     = sampleBuffer[i] & 0xFF;
-          txPacket[2 + i * 2 + 1] = (sampleBuffer[i] >> 8) & 0xFF;
-        }
-        pCharacteristic->setValue(txPacket, 2 + sampleCount * 2);
-        pCharacteristic->notify();
-      }
-      sampleCount = 0;
+  #gainValue {
+    font-family: var(--mono);
+    color: var(--text);
+    min-width: 34px;
+  }
+
+  .auto-toggle {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    margin-left: 6px;
+    cursor: pointer;
+  }
+
+  .auto-toggle input {
+    accent-color: var(--trace);
+    cursor: pointer;
+  }
+
+  canvas {
+    width: 100%;
+    height: 100%;
+    border-radius: 6px;
+    background: #081410;
+  }
+
+  .side {
+    flex: 0 1 240px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--panel-line);
+    border-radius: 10px;
+    padding: 18px;
+  }
+
+  .card .label {
+    font-size: 12px;
+    color: var(--text-dim);
+    margin-bottom: 6px;
+  }
+
+  .bpm-value {
+    font-family: var(--mono);
+    font-size: 44px;
+    font-weight: 600;
+    color: var(--trace);
+    line-height: 1;
+  }
+
+  .bpm-unit {
+    font-family: var(--mono);
+    font-size: 13px;
+    color: var(--text-dim);
+    margin-top: 4px;
+  }
+
+  .lead-value {
+    font-family: var(--mono);
+    font-size: 16px;
+    margin-top: 4px;
+  }
+
+  .lead-value.ok { color: var(--trace); }
+  .lead-value.off { color: var(--red); }
+
+  .instructions {
+    font-size: 13px;
+    color: var(--text-dim);
+    line-height: 1.6;
+  }
+
+  .instructions code {
+    font-family: var(--mono);
+    font-size: 12px;
+    background: #081410;
+    padding: 1px 5px;
+    border-radius: 4px;
+  }
+
+  footer {
+    padding: 10px 24px 18px;
+    font-size: 12px;
+    color: var(--text-dim);
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>ESP32 ECG Monitor <span>&mdash; AD8232 via BLE</span></h1>
+  <div class="status">
+    <div id="statusDot" class="dot"></div>
+    <span id="statusText">Belum terhubung</span>
+    <button id="connectBtn">Hubungkan perangkat</button>
+  </div>
+</header>
+
+<main>
+  <div class="trace-panel">
+    <div class="trace-header">
+      <div class="label">Sinyal ECG (real-time)</div>
+      <div class="gain-control">
+        <label for="gainSlider">Amplitudo</label>
+        <input type="range" id="gainSlider" min="0.5" max="6" step="0.1" value="2">
+        <span id="gainValue">2.0&times;</span>
+        <label class="auto-toggle">
+          <input type="checkbox" id="autoGainToggle" checked>
+          Otomatis
+        </label>
+      </div>
+    </div>
+    <canvas id="ecgCanvas"></canvas>
+  </div>
+
+  <div class="side">
+    <div class="card">
+      <div class="label">Perkiraan detak jantung</div>
+      <div class="bpm-value" id="bpmValue">&mdash;</div>
+      <div class="bpm-unit">BPM</div>
+    </div>
+
+    <div class="card">
+      <div class="label">Status elektroda</div>
+      <div class="lead-value ok" id="leadValue">Menunggu data</div>
+    </div>
+
+    <div class="card instructions">
+      Buka halaman ini lewat Chrome atau Edge (desktop atau Android), lalu
+      klik <strong>Hubungkan perangkat</strong> dan pilih
+      <code>ESP32-ECG</code> dari daftar. Web Bluetooth memerlukan koneksi
+      HTTPS atau membuka file ini langsung dari <code>localhost</code>.
+    </div>
+  </div>
+</main>
+
+<footer>
+  Service UUID: 6e400001-b5a3-f393-e0a9-e50e24dcca9e
+</footer>
+
+<script>
+  const SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+  const CHAR_UUID    = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
+
+  const connectBtn = document.getElementById("connectBtn");
+  const statusDot = document.getElementById("statusDot");
+  const statusText = document.getElementById("statusText");
+  const bpmValue = document.getElementById("bpmValue");
+  const leadValue = document.getElementById("leadValue");
+  const canvas = document.getElementById("ecgCanvas");
+  const ctx = canvas.getContext("2d");
+  const gainSlider = document.getElementById("gainSlider");
+  const gainValueLabel = document.getElementById("gainValue");
+  const autoGainToggle = document.getElementById("autoGainToggle");
+
+  // --- Buffer data untuk plotting ---
+  const MAX_POINTS = 900; // panjang jendela tampilan
+  let trace = new Array(MAX_POINTS).fill(2048);
+  let writeIndex = 0;
+
+  // --- Kontrol amplitudo ---
+  let manualGain = parseFloat(gainSlider.value);
+  let autoGain = true;
+
+  gainSlider.addEventListener("input", () => {
+    manualGain = parseFloat(gainSlider.value);
+    gainValueLabel.textContent = manualGain.toFixed(1) + "\u00d7";
+  });
+  autoGainToggle.addEventListener("change", () => {
+    autoGain = autoGainToggle.checked;
+    gainSlider.disabled = autoGain;
+  });
+  gainSlider.disabled = autoGain;
+
+  // --- Smoothing ringan tambahan di sisi tampilan (di atas filter firmware) ---
+  const SMOOTH_N = 3;
+  let smoothBuf = new Array(SMOOTH_N).fill(2048);
+  let smoothIdx = 0;
+
+  function smooth(value) {
+    smoothBuf[smoothIdx] = value;
+    smoothIdx = (smoothIdx + 1) % SMOOTH_N;
+    return smoothBuf.reduce((a, b) => a + b, 0) / SMOOTH_N;
+  }
+
+  // --- Deteksi puncak adaptif untuk estimasi BPM ---
+  let lastPeakTime = null;
+  let bpmHistory = [];
+  const REFRACTORY_MS = 280; // batas fisiologis, cegah deteksi ganda
+  let risingEdgeArmed = true;
+  let runningMin = 2048, runningMax = 2048;
+
+  function resizeCanvas() {
+    const dpr = window.devicePixelRatio || 1;
+    const rect = canvas.parentElement.getBoundingClientRect();
+    const cssW = rect.width - 32;
+    const cssH = rect.height - 64;
+    canvas.style.width = cssW + "px";
+    canvas.style.height = cssH + "px";
+    canvas.width = cssW * dpr;
+    canvas.height = cssH * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    canvas.cssWidth = cssW;
+    canvas.cssHeight = cssH;
+  }
+  window.addEventListener("resize", resizeCanvas);
+  resizeCanvas();
+
+  function drawGrid(w, h) {
+    const small = 8;   // kotak kecil, meniru kertas ECG
+    const bigEvery = 5; // garis tebal tiap 5 kotak
+
+    for (let x = 0, i = 0; x <= w; x += small, i++) {
+      ctx.beginPath();
+      ctx.strokeStyle = (i % bigEvery === 0)
+        ? "rgba(53, 212, 136, 0.22)"
+        : "rgba(53, 212, 136, 0.09)";
+      ctx.lineWidth = (i % bigEvery === 0) ? 1 : 0.5;
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, h);
+      ctx.stroke();
+    }
+    for (let y = 0, i = 0; y <= h; y += small, i++) {
+      ctx.beginPath();
+      ctx.strokeStyle = (i % bigEvery === 0)
+        ? "rgba(53, 212, 136, 0.22)"
+        : "rgba(53, 212, 136, 0.09)";
+      ctx.lineWidth = (i % bigEvery === 0) ? 1 : 0.5;
+      ctx.moveTo(0, y);
+      ctx.lineTo(w, y);
+      ctx.stroke();
     }
   }
-}
+
+  function drawTrace() {
+    const w = canvas.cssWidth, h = canvas.cssHeight;
+    ctx.clearRect(0, 0, w, h);
+    drawGrid(w, h);
+
+    // baseline sinyal = titik tengah antara min & max pada jendela yang tampil
+    const baseline = (runningMin + runningMax) / 2;
+    const span = Math.max(runningMax - runningMin, 40); // hindari pembagian dgn nilai kecil
+
+    // pixelsPerUnit menentukan berapa piksel per satuan nilai ADC.
+    // Mode otomatis: sinyal selalu diskalakan mengisi ~80% tinggi kanvas.
+    // Mode manual: skala tetap (relatif thd tinggi kanvas), dikendalikan slider.
+    const pixelsPerUnit = autoGain
+      ? (h * 0.8) / span
+      : manualGain * (h / 900);
+
+    const midY = h / 2;
+
+    ctx.beginPath();
+    ctx.strokeStyle = getComputedStyle(document.documentElement)
+      .getPropertyValue("--trace");
+    ctx.lineWidth = 2;
+    ctx.lineJoin = "round";
+    ctx.shadowColor = getComputedStyle(document.documentElement)
+      .getPropertyValue("--trace-glow");
+    ctx.shadowBlur = 7;
+
+    for (let i = 0; i < MAX_POINTS; i++) {
+      const idx = (writeIndex + i) % MAX_POINTS;
+      const val = trace[idx];
+      const x = (i / MAX_POINTS) * w;
+      const y = midY - (val - baseline) * pixelsPerUnit;
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+
+    // garis tengah tipis sebagai referensi baseline
+    ctx.beginPath();
+    ctx.strokeStyle = "rgba(216, 232, 224, 0.12)";
+    ctx.lineWidth = 1;
+    ctx.moveTo(0, midY);
+    ctx.lineTo(w, midY);
+    ctx.stroke();
+
+    requestAnimationFrame(drawTrace);
+  }
+  requestAnimationFrame(drawTrace);
+
+  function pushSample(rawValue, leadOff) {
+    const value = smooth(rawValue);
+    trace[writeIndex] = value;
+    writeIndex = (writeIndex + 1) % MAX_POINTS;
+
+    // update rentang min/max berjalan (dipakai untuk auto-scale & threshold)
+    let mn = Infinity, mx = -Infinity;
+    for (let i = 0; i < MAX_POINTS; i++) {
+      if (trace[i] < mn) mn = trace[i];
+      if (trace[i] > mx) mx = trace[i];
+    }
+    runningMin = mn;
+    runningMax = mx;
+
+    if (leadOff) return;
+
+    // ambang deteksi puncak R menyesuaikan otomatis ke rentang sinyal saat ini
+    const threshold = runningMin + (runningMax - runningMin) * 0.65;
+    const resetLevel = runningMin + (runningMax - runningMin) * 0.45;
+
+    const now = performance.now();
+    if (value > threshold && risingEdgeArmed) {
+      risingEdgeArmed = false;
+      if (lastPeakTime !== null) {
+        const interval = now - lastPeakTime;
+        if (interval > REFRACTORY_MS) {
+          const bpm = 60000 / interval;
+          if (bpm > 30 && bpm < 220) {
+            bpmHistory.push(bpm);
+            if (bpmHistory.length > 5) bpmHistory.shift();
+            const avg = bpmHistory.reduce((a, b) => a + b, 0) / bpmHistory.length;
+            bpmValue.textContent = Math.round(avg);
+          }
+          lastPeakTime = now;
+        }
+      } else {
+        lastPeakTime = now;
+      }
+    }
+    if (value < resetLevel) {
+      risingEdgeArmed = true;
+    }
+  }
+
+  function handleNotification(event) {
+    const dv = event.target.value; // DataView
+    const leadOff = dv.getUint8(0) === 1;
+    const count = dv.getUint8(1);
+
+    if (leadOff) {
+      leadValue.textContent = "Elektroda lepas";
+      leadValue.className = "lead-value off";
+    } else {
+      leadValue.textContent = "Terpasang baik";
+      leadValue.className = "lead-value ok";
+    }
+
+    for (let i = 0; i < count; i++) {
+      const sample = dv.getUint16(2 + i * 2, true); // little-endian
+      pushSample(sample, leadOff);
+    }
+  }
+
+  async function connect() {
+    try {
+      statusText.textContent = "Mencari perangkat...";
+      const device = await navigator.bluetooth.requestDevice({
+        filters: [{ name: "ESP32-ECG" }],
+        optionalServices: [SERVICE_UUID]
+      });
+
+      statusText.textContent = "Menghubungkan...";
+      const server = await device.gatt.connect();
+      const service = await server.getPrimaryService(SERVICE_UUID);
+      const characteristic = await service.getCharacteristic(CHAR_UUID);
+
+      await characteristic.startNotifications();
+      characteristic.addEventListener("characteristicvaluechanged", handleNotification);
+
+      statusDot.className = "dot live";
+      statusText.textContent = "Terhubung ke " + device.name;
+      connectBtn.textContent = "Terhubung";
+      connectBtn.disabled = true;
+
+      device.addEventListener("gattserverdisconnected", () => {
+        statusDot.className = "dot";
+        statusText.textContent = "Terputus";
+        connectBtn.textContent = "Hubungkan perangkat";
+        connectBtn.disabled = false;
+      });
+    } catch (err) {
+      statusDot.className = "dot warn";
+      statusText.textContent = "Gagal: " + err.message;
+      console.error(err);
+    }
+  }
+
+  connectBtn.addEventListener("click", connect);
+
+  if (!navigator.bluetooth) {
+    statusText.textContent = "Browser ini tidak mendukung Web Bluetooth";
+    connectBtn.disabled = true;
+  }
+</script>
+
+</body>
+</html>
