@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ESP32 ECG Monitor</title>
+<style>
+  :root{
+    --bg: #0a1512;
+    --panel: #0f1e19;
+    --panel-line: #1c352c;
+    --grid: rgba(53, 212, 136, 0.14);
+    --trace: #38e08a;
+    --trace-glow: rgba(56, 224, 138, 0.35);
+    --text: #d8e8e0;
+    --text-dim: #7d998e;
+    --amber: #e8a545;
+    --red: #e05a4f;
+    --mono: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
+    --sans: "Inter", "Segoe UI", system-ui, sans-serif;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+  }
+
+  body {
+    display: flex;
+    flex-direction: column;
+    min-height: 100vh;
+  }
+
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 18px 24px;
+    border-bottom: 1px solid var(--panel-line);
+    flex-wrap: wrap;
+    gap: 12px;
+  }
+
+  header h1 {
+    font-size: 17px;
+    font-weight: 600;
+    margin: 0;
+    letter-spacing: 0.2px;
+  }
+
+  header h1 span {
+    color: var(--text-dim);
+    font-weight: 400;
+  }
+
+  .status {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    color: var(--text-dim);
+  }
+
+  .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--text-dim);
+    transition: background 0.2s ease;
+  }
+
+  .dot.live { background: var(--trace); box-shadow: 0 0 8px var(--trace-glow); }
+  .dot.warn { background: var(--amber); }
+
+  button {
+    font-family: var(--sans);
+    font-size: 14px;
+    font-weight: 500;
+    padding: 9px 18px;
+    border-radius: 6px;
+    border: 1px solid var(--panel-line);
+    background: var(--panel);
+    color: var(--text);
+    cursor: pointer;
+  }
+
+  button:hover { border-color: var(--trace); }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  main {
+    flex: 1;
+    display: flex;
+    gap: 20px;
+    padding: 20px 24px 28px;
+    flex-wrap: wrap;
+  }
+
+  .trace-panel {
+    flex: 1 1 560px;
+    background: var(--panel);
+    border: 1px solid var(--panel-line);
+    border-radius: 10px;
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    min-height: 360px;
+  }
+
+  .trace-panel .label {
+    font-size: 12px;
+    color: var(--text-dim);
+    margin-bottom: 10px;
+  }
+
+  canvas {
+    width: 100%;
+    height: 100%;
+    border-radius: 6px;
+    background: #081410;
+  }
+
+  .side {
+    flex: 0 1 240px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--panel-line);
+    border-radius: 10px;
+    padding: 18px;
+  }
+
+  .card .label {
+    font-size: 12px;
+    color: var(--text-dim);
+    margin-bottom: 6px;
+  }
+
+  .bpm-value {
+    font-family: var(--mono);
+    font-size: 44px;
+    font-weight: 600;
+    color: var(--trace);
+    line-height: 1;
+  }
+
+  .bpm-unit {
+    font-family: var(--mono);
+    font-size: 13px;
+    color: var(--text-dim);
+    margin-top: 4px;
+  }
+
+  .lead-value {
+    font-family: var(--mono);
+    font-size: 16px;
+    margin-top: 4px;
+  }
+
+  .lead-value.ok { color: var(--trace); }
+  .lead-value.off { color: var(--red); }
+
+  .instructions {
+    font-size: 13px;
+    color: var(--text-dim);
+    line-height: 1.6;
+  }
+
+  .instructions code {
+    font-family: var(--mono);
+    font-size: 12px;
+    background: #081410;
+    padding: 1px 5px;
+    border-radius: 4px;
+  }
+
+  footer {
+    padding: 10px 24px 18px;
+    font-size: 12px;
+    color: var(--text-dim);
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>ESP32 ECG Monitor <span>&mdash; AD8232 via BLE</span></h1>
+  <div class="status">
+    <div id="statusDot" class="dot"></div>
+    <span id="statusText">Belum terhubung</span>
+    <button id="connectBtn">Hubungkan perangkat</button>
+  </div>
+</header>
+
+<main>
+  <div class="trace-panel">
+    <div class="label">Sinyal ECG (real-time)</div>
+    <canvas id="ecgCanvas"></canvas>
+  </div>
+
+  <div class="side">
+    <div class="card">
+      <div class="label">Perkiraan detak jantung</div>
+      <div class="bpm-value" id="bpmValue">&mdash;</div>
+      <div class="bpm-unit">BPM</div>
+    </div>
+
+    <div class="card">
+      <div class="label">Status elektroda</div>
+      <div class="lead-value ok" id="leadValue">Menunggu data</div>
+    </div>
+
+    <div class="card instructions">
+      Buka halaman ini lewat Chrome atau Edge (desktop atau Android), lalu
+      klik <strong>Hubungkan perangkat</strong> dan pilih
+      <code>ESP32-ECG</code> dari daftar. Web Bluetooth memerlukan koneksi
+      HTTPS atau membuka file ini langsung dari <code>localhost</code>.
+    </div>
+  </div>
+</main>
+
+<footer>
+  Service UUID: 6e400001-b5a3-f393-e0a9-e50e24dcca9e
+</footer>
+
+<script>
+  const SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+  const CHAR_UUID    = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
+
+  const connectBtn = document.getElementById("connectBtn");
+  const statusDot = document.getElementById("statusDot");
+  const statusText = document.getElementById("statusText");
+  const bpmValue = document.getElementById("bpmValue");
+  const leadValue = document.getElementById("leadValue");
+  const canvas = document.getElementById("ecgCanvas");
+  const ctx = canvas.getContext("2d");
+
+  // --- Buffer data untuk plotting ---
+  const MAX_POINTS = 900; // panjang jendela tampilan
+  let trace = new Array(MAX_POINTS).fill(2048);
+  let writeIndex = 0;
+
+  // --- Deteksi puncak sederhana untuk estimasi BPM ---
+  let lastPeakTime = null;
+  let bpmHistory = [];
+  const REFRACTORY_MS = 280; // batas fisiologis, cegah deteksi ganda
+  let risingEdgeArmed = true;
+  const PEAK_THRESHOLD = 2600; // sesuaikan dengan amplitudo sinyal Anda
+
+  function resizeCanvas() {
+    const rect = canvas.parentElement.getBoundingClientRect();
+    canvas.width = rect.width - 32;
+    canvas.height = rect.height - 40;
+  }
+  window.addEventListener("resize", resizeCanvas);
+  resizeCanvas();
+
+  function drawGrid() {
+    const w = canvas.width, h = canvas.height;
+    ctx.strokeStyle = getComputedStyle(document.documentElement)
+      .getPropertyValue("--grid");
+    ctx.lineWidth = 1;
+    const step = 32;
+    for (let x = 0; x < w; x += step) {
+      ctx.beginPath();
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, h);
+      ctx.stroke();
+    }
+    for (let y = 0; y < h; y += step) {
+      ctx.beginPath();
+      ctx.moveTo(0, y);
+      ctx.lineTo(w, y);
+      ctx.stroke();
+    }
+  }
+
+  function drawTrace() {
+    const w = canvas.width, h = canvas.height;
+    ctx.clearRect(0, 0, w, h);
+    drawGrid();
+
+    ctx.beginPath();
+    ctx.strokeStyle = getComputedStyle(document.documentElement)
+      .getPropertyValue("--trace");
+    ctx.lineWidth = 2;
+    ctx.shadowColor = getComputedStyle(document.documentElement)
+      .getPropertyValue("--trace-glow");
+    ctx.shadowBlur = 6;
+
+    for (let i = 0; i < MAX_POINTS; i++) {
+      const idx = (writeIndex + i) % MAX_POINTS;
+      const val = trace[idx];
+      const x = (i / MAX_POINTS) * w;
+      const y = h - (val / 4095) * h;
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+
+    requestAnimationFrame(drawTrace);
+  }
+  requestAnimationFrame(drawTrace);
+
+  function pushSample(value, leadOff) {
+    trace[writeIndex] = value;
+    writeIndex = (writeIndex + 1) % MAX_POINTS;
+
+    if (leadOff) return;
+
+    const now = performance.now();
+    if (value > PEAK_THRESHOLD && risingEdgeArmed) {
+      risingEdgeArmed = false;
+      if (lastPeakTime !== null) {
+        const interval = now - lastPeakTime;
+        if (interval > REFRACTORY_MS) {
+          const bpm = 60000 / interval;
+          if (bpm > 30 && bpm < 220) {
+            bpmHistory.push(bpm);
+            if (bpmHistory.length > 5) bpmHistory.shift();
+            const avg = bpmHistory.reduce((a, b) => a + b, 0) / bpmHistory.length;
+            bpmValue.textContent = Math.round(avg);
+          }
+          lastPeakTime = now;
+        }
+      } else {
+        lastPeakTime = now;
+      }
+    }
+    if (value < PEAK_THRESHOLD * 0.8) {
+      risingEdgeArmed = true;
+    }
+  }
+
+  function handleNotification(event) {
+    const dv = event.target.value; // DataView
+    const leadOff = dv.getUint8(0) === 1;
+    const count = dv.getUint8(1);
+
+    if (leadOff) {
+      leadValue.textContent = "Elektroda lepas";
+      leadValue.className = "lead-value off";
+    } else {
+      leadValue.textContent = "Terpasang baik";
+      leadValue.className = "lead-value ok";
+    }
+
+    for (let i = 0; i < count; i++) {
+      const sample = dv.getUint16(2 + i * 2, true); // little-endian
+      pushSample(sample, leadOff);
+    }
+  }
+
+  async function connect() {
+    try {
+      statusText.textContent = "Mencari perangkat...";
+      const device = await navigator.bluetooth.requestDevice({
+        filters: [{ name: "ESP32-ECG" }],
+        optionalServices: [SERVICE_UUID]
+      });
+
+      statusText.textContent = "Menghubungkan...";
+      const server = await device.gatt.connect();
+      const service = await server.getPrimaryService(SERVICE_UUID);
+      const characteristic = await service.getCharacteristic(CHAR_UUID);
+
+      await characteristic.startNotifications();
+      characteristic.addEventListener("characteristicvaluechanged", handleNotification);
+
+      statusDot.className = "dot live";
+      statusText.textContent = "Terhubung ke " + device.name;
+      connectBtn.textContent = "Terhubung";
+      connectBtn.disabled = true;
+
+      device.addEventListener("gattserverdisconnected", () => {
+        statusDot.className = "dot";
+        statusText.textContent = "Terputus";
+        connectBtn.textContent = "Hubungkan perangkat";
+        connectBtn.disabled = false;
+      });
+    } catch (err) {
+      statusDot.className = "dot warn";
+      statusText.textContent = "Gagal: " + err.message;
+      console.error(err);
+    }
+  }
+
+  connectBtn.addEventListener("click", connect);
+
+  if (!navigator.bluetooth) {
+    statusText.textContent = "Browser ini tidak mendukung Web Bluetooth";
+    connectBtn.disabled = true;
+  }
+</script>
+
+</body>
+</html>
